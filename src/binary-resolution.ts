@@ -1,6 +1,6 @@
 import { existsSync as defaultExistsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, resolve } from "node:path";
+import { posix, win32 } from "node:path";
 
 const require = createRequire(import.meta.url);
 
@@ -34,6 +34,15 @@ function firstExisting(candidates: string[], existsSync: (candidate: string) => 
   return candidates.find((candidate) => existsSync(candidate));
 }
 
+function isWindowsAbsolutePath(filePath: string): boolean {
+  return /^[a-zA-Z]:[\\/]/.test(filePath) || filePath.startsWith("\\\\");
+}
+
+function resolveBinPathFromPackageJson(packageJsonPath: string, binEntry: string): string {
+  const path = isWindowsAbsolutePath(packageJsonPath) ? win32 : posix;
+  return path.resolve(path.dirname(packageJsonPath), binEntry);
+}
+
 export interface ExecutableCommand {
   command: string;
   argsPrefix: string[];
@@ -59,13 +68,12 @@ export function resolveBundledBin(
 
   try {
     const packageJsonPath = resolvePackageJson(`${packageName}/package.json`);
-    const packageDir = dirname(packageJsonPath);
     const binEntry = binEntryFor(readPackageJson(packageJsonPath), binName);
     if (!binEntry) return fallbackCommand;
 
-
+    const absoluteBinPath = resolveBinPathFromPackageJson(packageJsonPath, binEntry);
     const packageBinCandidate = firstExisting(
-      commandCandidates(resolve(packageDir, binEntry), platform),
+      commandCandidates(absoluteBinPath, platform),
       existsSync,
     );
     if (packageBinCandidate) return packageBinCandidate;
