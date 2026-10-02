@@ -110,10 +110,13 @@ function isReplaceEdit(edit: unknown): edit is ReplaceEdit {
 type AnchorEdit =
 	| { set_line: { anchor: string; new_text: string } }
 	| { replace_lines: { start_anchor: string; end_anchor: string; new_text: string } }
-	| { insert_after: { anchor: string; new_text: string; text?: string } };
+	| { insert_after: { anchor: string; new_text: string; text?: string } }
+	| { copy_lines: { start_anchor: string; end_anchor: string; after_anchor: string; from_path?: string } }
+	| { move_lines: { start_anchor: string; end_anchor: string; after_anchor: string } };
 
+/** Cross-file copies (`copy_lines.from_path`) are not projected; the preview is skipped for them. */
 function isAnchorEdit(edit: unknown): edit is AnchorEdit {
-	return !!edit && typeof edit === "object" && ("set_line" in edit || "replace_lines" in edit || "insert_after" in edit);
+	return !!edit && typeof edit === "object" && ("set_line" in edit || "replace_lines" in edit || "insert_after" in edit || "copy_lines" in edit || "move_lines" in edit);
 }
 
 function applyAnchoredPreview(content: string, edits: AnchorEdit[]): { type: "ok"; content: string } | { type: "skip"; reason: string } {
@@ -150,6 +153,14 @@ async function applyReplaceSymbolPreview(filePath: string, content: string, edit
 function applyReplacePreview(content: string, edit: ReplaceEdit): { type: "ok"; content: string } | { type: "skip"; reason: string } {
 	const { old_text, new_text } = edit.replace;
 	if (!old_text.length) return { type: "skip", reason: "replace old_text is empty" };
+	if (!edit.replace.all) {
+		const exact = old_text.replace(/\r\n/g, "\n");
+		const first = content.indexOf(exact);
+		// Execution refuses ambiguous matches, so do not preview a first-occurrence edit.
+		if (first !== -1 && content.indexOf(exact, first + exact.length) !== -1) {
+			return { type: "skip", reason: "replace old_text occurs more than once" };
+		}
+	}
 	const replacement = replaceText(content, old_text, new_text, {
 		all: edit.replace.all ?? false,
 		fuzzy: edit.replace.fuzzy ?? false,

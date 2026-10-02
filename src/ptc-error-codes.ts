@@ -1,5 +1,6 @@
 /**
- * PTC error code taxonomy — single source of truth.
+ * Structured error code taxonomy (`details.ptcValue.error.code`) — single source of truth.
+ * The `Ptc` prefix is historical; these codes are what tool_result handlers and renderers see.
  *
  * Every error returned via `ptcValue.error.code` MUST be a key in this map.
  * To add a new error: extend this object with a kebab-case code, a one-line
@@ -38,6 +39,8 @@ export const PTC_ERROR_CODES = {
   },
   "no-op": { description: "edits produced identical content", trigger: "originalNormalized === result after applying edits" },
   "text-not-found": { description: "replace.old_text not present in file", trigger: "replaceText returned 0 matches" },
+  "ambiguous-match": { description: "replace.old_text occurs more than once and all is not set", trigger: "exact old_text matched at several offsets" },
+  "corrupted-retype": { description: "new_text retypes 3+ lines the model was shown but changes invisible or lookalike characters", trigger: "findCorruptedRetype matched a block that differs only in such characters" },
   "binary-file": { description: "edit refused because file is binary", trigger: "looksLikeBinary detected NUL bytes or invalid UTF-8" },
   "invalid-edit-variant": { description: "edits[i] is not exactly one of set_line/replace_lines/insert_after/replace", trigger: "exactly-one variant check failed" },
 

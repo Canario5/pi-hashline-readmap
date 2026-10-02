@@ -16,6 +16,9 @@ import {
 	type HashlineEditItem,
 	escapeControlCharsForDisplay,
 } from "./hashline.js";
+import { findCorruptedRetype } from "./retype-guard.js";
+import { formatStaleRows, overwrittenLines, type ServedLines } from "./served-lines.js";
+import type { PtcLine } from "./ptc-value.js";
 import { resolveToCwd } from "./path-utils.js";
 import { resolveMutationTargetPath, writeFileAtomically } from "./fs-write.js";
 import { throwIfAborted } from "./runtime.js";
@@ -101,6 +104,22 @@ const hashlineEditItemSchema = Type.Union([
 		replace_symbol: Type.Object({
 			symbol: Type.String(),
 			new_body: Type.String({ description: "Non-blank complete symbol body" }),
+		}),
+	}, { additionalProperties: true })),
+	withLegacyObjectOrder(Type.Object({
+		copy_lines: Type.Object({
+			start_anchor: Type.String({ description: "First source line (LINE:HASH)" }),
+			end_anchor: Type.String({ description: "Last source line (LINE:HASH)" }),
+			after_anchor: Type.String({ description: "Insert the copy after this line of path (LINE:HASH)" }),
+			from_path: Type.Optional(Type.String({ description: "Source file to copy from; default path" })),
+		}),
+	}, { additionalProperties: true })),
+	withLegacyObjectOrder(Type.Object({
+		move_lines: Type.Object({
+			start_anchor: Type.String({ description: "First line to move (LINE:HASH)" }),
+			end_anchor: Type.String({ description: "Last line to move (LINE:HASH)" }),
+			after_anchor: Type.String({ description: "Move the lines after this line (LINE:HASH)" }),
+			from_path: Type.Optional(Type.String({ description: "Move from this file into path; default path" })),
 		}),
 	}, { additionalProperties: true })),
 	withLegacyObjectOrder(Type.Object(
@@ -269,20 +288,23 @@ function validateEdits(input: {
 			Number("set_line" in edit) +
 			Number("replace_lines" in edit) +
 			Number("insert_after" in edit) +
+			Number("copy_lines" in edit) +
+			Number("move_lines" in edit) +
 			Number("replace" in edit) +
 			Number("replace_symbol" in edit);
 		if (variantCount !== 1) {
 			return buildEditError(
 				absolutePath,
 				"invalid-edit-variant",
-				`edits[${i}] must contain exactly one of: 'set_line', 'replace_lines', 'insert_after', 'replace', 'replace_symbol'. Got: [${Object.keys(edit).join(", ")}].`,
+				`edits[${i}] must contain exactly one of: 'set_line', 'replace_lines', 'insert_after', 'copy_lines', 'move_lines', 'replace', 'replace_symbol'. Got: [${Object.keys(edit).join(", ")}].`,
 			);
 		}
 	}
 
 	const anchorEdits = edits.filter(
-		(edit): edit is HashlineEditItem => "set_line" in edit || "replace_lines" in edit || "insert_after" in edit,
-	);
+		(edit): edit is Extract<EditItem, HashlineEditItem> =>
+			"set_line" in edit || "replace_lines" in edit || "insert_after" in edit || "copy_lines" in edit || "move_lines" in edit,
+	) as HashlineEditItem[];
 	const replaceEdits = edits.filter(
 		(edit): edit is ReplaceEditItem => "replace" in edit,
 	);
@@ -363,7 +385,11 @@ async function resolveReplaceSymbols(input: {
 			newBody: edit.replace_symbol.new_body,
 		});
 		if (probe.type !== "ok") {
-			return buildEditError(input.absolutePath, "invalid-edit-variant", probe.message);
+			const message =
+				probe.type === "not-found"
+					? `${probe.message}\n${describeLineTargetForSymbolSlip(input.originalNormalized, edit.replace_symbol.symbol)}`
+					: probe.message;
+			return buildEditError(input.absolutePath, "invalid-edit-variant", message);
 		}
 		probes.push(probe);
 	}
@@ -459,14 +485,119 @@ function applyResolvedReplaceSymbols(
 
 type AnchorEditResult = ReturnType<typeof applyHashlineEdits>;
 
-function applyAnchorEdits(input: {
+/** The `from_path` of a copy or move, trimmed; undefined when the edit reads only the edited file. */
+function crossFilePath(edit: HashlineEditItem): string | undefined {
+	const fromPath = "copy_lines" in edit ? edit.copy_lines.from_path : "move_lines" in edit ? edit.move_lines.from_path : undefined;
+	return fromPath?.trim() || undefined;
+}
+
+interface SourceRemoval {
+	absolutePath: string;
+	displayPath: string;
+	originalNormalized: string;
+	result: string;
+	bom: string;
+	originalEnding: ReturnType<typeof detectLineEnding>;
+	ranges: string[];
+}
+
+/**
+ * For `move_lines` with a `from_path` in another file: verify and compute the source file with the
+ * moved range removed, before anything is written. The source needs fresh anchors like any edit.
+ */
+async function planSourceRemovals(input: {
+	anchorEdits: HashlineEditItem[];
+	absolutePath: string;
+	cwd: string;
+	options: EditToolOptions;
+	signal?: AbortSignal;
+}): Promise<EditPhaseResult<SourceRemoval[]>> {
+	const bySource = new Map<string, { displayPath: string; edits: HashlineEditItem[]; ranges: string[] }>();
+	for (const edit of input.anchorEdits) {
+		if (!("move_lines" in edit)) continue;
+		const fromPath = crossFilePath(edit);
+		if (fromPath === undefined) continue;
+		const sourcePath = resolveToCwd(fromPath.replace(/^@/, ""), input.cwd);
+		if (sourcePath === input.absolutePath) continue;
+		const entry = bySource.get(sourcePath) ?? { displayPath: fromPath, edits: [], ranges: [] };
+		entry.edits.push({ replace_lines: { start_anchor: edit.move_lines.start_anchor, end_anchor: edit.move_lines.end_anchor, new_text: "" } });
+		entry.ranges.push(`${edit.move_lines.start_anchor}..${edit.move_lines.end_anchor}`);
+		bySource.set(sourcePath, entry);
+	}
+	const removals: SourceRemoval[] = [];
+	for (const [sourcePath, entry] of bySource) {
+		const notRead = requireReadForAnchors(input.options, sourcePath, entry.displayPath, true);
+		if (notRead) return notRead;
+		const loaded = await loadEditSource({ absolutePath: sourcePath, displayPath: entry.displayPath, signal: input.signal });
+		if (isEditErrorResult(loaded)) return loaded;
+		const applied = await applyAnchorEdits({ absolutePath: sourcePath, content: loaded.originalNormalized, anchorEdits: entry.edits, cwd: input.cwd, signal: input.signal });
+		if (isEditErrorResult(applied)) return recordErrorFeedback(input.options, sourcePath, applied);
+		const stale = rejectStaleOverwrites(input.options.served, sourcePath, loaded.originalNormalized, applied.content);
+		if (stale) {
+			input.options.onFileAnchored?.(sourcePath);
+			return stale;
+		}
+		removals.push({ absolutePath: sourcePath, displayPath: entry.displayPath, ...loaded, result: applied.content, ranges: entry.ranges });
+	}
+	return removals;
+}
+
+/** Write planned source removals after the target was written. A failure names the half-done state. */
+async function commitSourceRemovals(removals: SourceRemoval[], options: EditToolOptions, targetDisplayPath: string): Promise<EditPhaseResult<string[]>> {
+	const notes: string[] = [];
+	for (const removal of removals) {
+		const written = await withFileMutationQueue(await resolveMutationTargetPath(removal.absolutePath), () =>
+			finalizeWrite({ ...removal, postEditVerify: false }),
+		);
+		if (isEditErrorResult(written)) {
+			const text = `${written.content[0].text}\n${targetDisplayPath} was already written with the moved lines; they are still in ${removal.displayPath} too. Delete them there to finish the move.`;
+			return { ...written, content: [{ type: "text", text }] };
+		}
+		options.served?.remapAfterWrite(removal.absolutePath, removal.originalNormalized.split("\n"), removal.result.split("\n"));
+		notes.push(`Moved lines ${removal.ranges.join(", ")} out of ${removal.displayPath}; read it again for fresh anchors there.`);
+	}
+	return notes;
+}
+/** Read the other files `copy_lines.from_path` names, LF-normalized, keyed by the given string. */
+async function loadCopySources(
+	anchorEdits: HashlineEditItem[],
+	absolutePath: string,
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<EditPhaseResult<Map<string, string>>> {
+	const sources = new Map<string, string>();
+	for (const edit of anchorEdits) {
+		const fromPath = crossFilePath(edit);
+		if (fromPath === undefined) continue;
+		if (!fromPath || sources.has(fromPath)) continue;
+		const sourcePath = resolveToCwd(fromPath.replace(/^@/, ""), cwd);
+		if (sourcePath === absolutePath) continue;
+		const loaded = await loadEditSource({ absolutePath: sourcePath, displayPath: fromPath, signal });
+		if (isEditErrorResult(loaded)) return loaded;
+		sources.set(fromPath, loaded.originalNormalized);
+	}
+	return sources;
+}
+
+async function applyAnchorEdits(input: {
 	absolutePath: string;
 	content: string;
 	anchorEdits: HashlineEditItem[];
+	cwd: string;
 	signal?: AbortSignal;
-}): EditPhaseResult<AnchorEditResult> {
+}): Promise<EditPhaseResult<AnchorEditResult>> {
+	const sources = await loadCopySources(input.anchorEdits, input.absolutePath, input.cwd, input.signal);
+	if (isEditErrorResult(sources)) return sources;
+	// A from_path naming the edited file itself is a copy or move within the file.
+	const anchorEdits = input.anchorEdits.map((edit) => {
+		const fromPath = crossFilePath(edit);
+		if (fromPath === undefined || sources.has(fromPath)) return edit;
+		if ("copy_lines" in edit) return { copy_lines: { ...edit.copy_lines, from_path: undefined } };
+		if ("move_lines" in edit) return { move_lines: { ...edit.move_lines, from_path: undefined } };
+		return edit;
+	});
 	try {
-		return applyHashlineEdits(input.content, input.anchorEdits, input.signal);
+		return applyHashlineEdits(input.content, anchorEdits, input.signal, { sources });
 	} catch (err) {
 		if (err instanceof HashlineMismatchError) {
 			return buildEditError(input.absolutePath, "hash-mismatch", err.message, undefined, {
@@ -478,6 +609,137 @@ function applyAnchorEdits(input: {
 		}
 		throw err;
 	}
+}
+
+/** A row as tools display it, `LINE:HASH|content` or the bare `HASH|content` slip. */
+const SHOWN_ROW_RE = /^(?:\d+:)?([0-9a-f]{3})\|(.*)$/;
+const SHOWN_TERMINATOR_ROW_RE = /^(?:\d+:)?([0-9a-f]{3})\|?$/;
+
+function splitTextRows(text: string): string[] {
+	return normalizeToLF(text).replace(/\n$/, "").split("\n");
+}
+
+/**
+ * Models often paste displayed rows into `replace.old_text`. When every row carries a prefix whose
+ * hash matches its own content, the rows are a verified copy of shown lines: return their content.
+ */
+function stripVerifiedRowPrefixes(text: string): string[] | undefined {
+	const rows = splitTextRows(text);
+	const emptyHash = computeLineHash(0, "");
+	const last = rows[rows.length - 1];
+	const terminator = last !== undefined ? SHOWN_TERMINATOR_ROW_RE.exec(last) : null;
+	if (rows.length > 1 && terminator && terminator[1] === emptyHash) rows.pop();
+	const out: string[] = [];
+	for (const row of rows) {
+		const match = SHOWN_ROW_RE.exec(row);
+		if (!match || computeLineHash(0, match[2]) !== match[1]) return undefined;
+		out.push(match[2]);
+	}
+	return out.length ? out : undefined;
+}
+
+/** Replacement rows for a prefixed `old_text`: drop any pasted row prefixes, keep the rest literal. */
+function stripPastedRowPrefixes(text: string): string[] {
+	if (text === "") return [];
+	return splitTextRows(text).map((row) => SHOWN_ROW_RE.exec(row)?.[2] ?? row);
+}
+
+/** Replace whole lines equal to `oldRows` (exact, line-aligned). */
+function replaceLineBlock(
+	content: string,
+	oldRows: string[],
+	newRows: string[],
+	all: boolean,
+): { content: string; count: number } {
+	const lines = content.split("\n");
+	const starts: number[] = [];
+	for (let start = 0; start + oldRows.length <= lines.length; start++) {
+		if (oldRows.every((row, offset) => lines[start + offset] === row)) {
+			starts.push(start);
+			start += oldRows.length - 1;
+		}
+	}
+	if (starts.length === 0 || (!all && starts.length > 1)) return { content, count: starts.length > 1 ? -starts.length : 0 };
+	for (const start of [...starts].reverse()) lines.splice(start, oldRows.length, ...newRows);
+	return { content: lines.join("\n"), count: starts.length };
+}
+
+function lineSimilarity(needle: string, line: string): number {
+	const a = needle.trim();
+	const b = line.trim();
+	if (!a || !b) return 0;
+	if (b.includes(a) || a.includes(b)) return 1;
+	const tokens = (s: string) => new Set(s.split(/[^\p{L}\p{N}_]+/u).filter(Boolean));
+	const ta = tokens(a);
+	const tb = tokens(b);
+	if (!ta.size || !tb.size) return 0;
+	let overlap = 0;
+	for (const token of ta) if (tb.has(token)) overlap++;
+	return overlap / Math.max(ta.size, tb.size);
+}
+
+/** Current rows most like `needle`, as fresh `LINE:HASH|content` anchors. */
+function closestRows(content: string, needle: string, max = 4): PtcLine[] {
+	const lines = content.split("\n");
+	return lines
+		.map((raw, index) => ({ raw, line: index + 1, score: lineSimilarity(needle, raw) }))
+		.filter((candidate) => candidate.score >= 0.5)
+		.sort((a, b) => b.score - a.score || a.line - b.line)
+		.slice(0, max)
+		.sort((a, b) => a.line - b.line)
+		.map(({ raw, line }) => {
+			const hash = computeLineHash(line, raw);
+			const display = escapeControlCharsForDisplay(raw);
+			return { line, hash, anchor: `${line}:${hash}`, raw, display };
+		});
+}
+
+function formatRows(rows: readonly PtcLine[]): string {
+	return rows.map((row) => `  ${row.anchor}|${row.display}`).join("\n");
+}
+
+/**
+ * An exact `old_text` that occurs more than once would silently edit the first occurrence. Refuse
+ * and show the line each occurrence starts on, so the model can add context or use an anchor.
+ */
+function describeAmbiguousReplace(content: string, oldText: string, displayPath: string): { message: string; rows: PtcLine[] } | undefined {
+	const starts: number[] = [];
+	for (let index = content.indexOf(oldText); index !== -1; index = content.indexOf(oldText, index + oldText.length)) {
+		starts.push(index);
+	}
+	if (starts.length < 2) return undefined;
+	const lines = content.split("\n");
+	const lineNumbers = [...new Set(starts.map((index) => content.slice(0, index).split("\n").length))];
+	const rows: PtcLine[] = lineNumbers.slice(0, 10).map((line) => {
+		const raw = lines[line - 1] ?? "";
+		const hash = computeLineHash(line, raw);
+		return { line, hash, anchor: `${line}:${hash}`, raw, display: escapeControlCharsForDisplay(raw) };
+	});
+	const more = lineNumbers.length > rows.length ? `\n  ... and ${lineNumbers.length - rows.length} more lines` : "";
+	return {
+		message: [
+			`replace.old_text occurs ${starts.length} times in ${displayPath}; nothing was written. Matches start on:`,
+			formatRows(rows) + more,
+			"Add surrounding text to old_text so it matches once, set all: true to replace every occurrence, or use set_line with the anchor of the line you mean.",
+		].join("\n"),
+		rows,
+	};
+}
+
+/** Guidance when replace_symbol names a line, an anchor, or a file instead of a declaration. */
+function describeLineTargetForSymbolSlip(content: string, symbol: string): string {
+	const row = SHOWN_ROW_RE.exec(symbol.trim().split("\n")[0] ?? "");
+	const needle = row ? row[2] : symbol.replace(/^\d+:[0-9a-f]{3}\|?/, "");
+	const rows = needle.trim() ? closestRows(content, needle, 3) : [];
+	const example = rows[0]
+		? `{"set_line": {"anchor": "${rows[0].anchor}", "new_text": "..."}}`
+		: `{"set_line": {"anchor": "LINE:HASH", "new_text": "..."}}`;
+	return [
+		"replace_symbol only replaces a named declaration (function, class, method). To change lines, use set_line, replace_lines, or insert_after with LINE:HASH anchors from read, for example " +
+			example +
+			".",
+		...(rows.length ? ["Matching lines:", formatRows(rows)] : []),
+	].join("\n");
 }
 
 function applyReplaceEdits(input: {
@@ -494,25 +756,95 @@ function applyReplaceEdits(input: {
 		if (!edit.replace.old_text.length) {
 			return buildEditError(input.absolutePath, "invalid-edit-variant", "replace.old_text must not be empty.");
 		}
-		const replacement = replaceText(content, edit.replace.old_text, edit.replace.new_text, {
-			all: edit.replace.all ?? false,
+		// Files are compared LF-normalized; a CRLF-typed old_text would otherwise never match.
+		const oldText = edit.replace.old_text.replace(/\r\n/g, "\n");
+		const all = edit.replace.all ?? false;
+		if (!all) {
+			const ambiguous = describeAmbiguousReplace(content, oldText, input.displayPath);
+			if (ambiguous) {
+				return buildEditError(input.absolutePath, "ambiguous-match", ambiguous.message, undefined, { updatedAnchors: ambiguous.rows });
+			}
+		}
+		const replacement = replaceText(content, oldText, edit.replace.new_text, {
+			all,
 			fuzzy: edit.replace.fuzzy ?? false,
 		});
-		if (!replacement.count) {
-			const message = `Could not find exact text to replace in ${input.displayPath}.`;
-			const hint =
-				"Re-read the file and prefer set_line/replace_lines/insert_after for hash-verified edits. " +
-				"The replace variant is exact-only by default because fuzzy fallback is unverified.";
-			return buildEditError(input.absolutePath, "text-not-found", message, hint);
+		if (replacement.count) {
+			if (replacement.usedFuzzyMatch) {
+				warnings.push(
+					"replace used fuzzy matching because exact old_text was not found; re-read the file and prefer set_line/replace_lines/insert_after for hash-verified edits.",
+				);
+			}
+			content = replacement.content;
+			continue;
 		}
-		if (replacement.usedFuzzyMatch) {
-			warnings.push(
-				"replace used fuzzy matching because exact old_text was not found; re-read the file and prefer set_line/replace_lines/insert_after for hash-verified edits.",
+
+		// old_text pasted as displayed rows (`2:467|bbb` or `467|bbb`): every prefix hash verifies
+		// its own row, so match those rows as whole lines. A row that changed since it was shown
+		// no longer exists and the edit is refused below instead of matching a substring.
+		const shownRows = stripVerifiedRowPrefixes(oldText);
+		if (shownRows) {
+			const block = replaceLineBlock(content, shownRows, stripPastedRowPrefixes(edit.replace.new_text), all);
+			if (block.count > 0) {
+				warnings.push(
+					"replace.old_text contained LINE:HASH| row prefixes; matched those rows as whole lines. Next time, use set_line/replace_lines with the anchors, or pass old_text without prefixes.",
+				);
+				content = block.content;
+				continue;
+			}
+			if (block.count < 0) {
+				return buildEditError(
+					input.absolutePath,
+					"text-not-found",
+					`replace.old_text matches ${-block.count} places in ${input.displayPath}. Use set_line or replace_lines with the LINE:HASH anchor of the one you mean.`,
+				);
+			}
+		}
+
+		const needle = (shownRows ?? splitTextRows(oldText)).find((row) => row.trim().length > 0) ?? oldText;
+		const rows = closestRows(content, needle);
+		const lines = [`Could not find exact text to replace in ${input.displayPath}.`];
+		if (rows.length) {
+			lines.push("Closest current lines:", formatRows(rows));
+			lines.push(
+				`To change a line, use set_line with its anchor, for example {"set_line": {"anchor": "${rows[0].anchor}", "new_text": "..."}}.`,
 			);
+		} else {
+			lines.push("No similar line exists; the text may have changed. Re-read the file.");
 		}
-		content = replacement.content;
+		lines.push("old_text must match the file exactly and must not include LINE:HASH| prefixes.");
+		const hint =
+			"Re-read the file if unsure and prefer set_line/replace_lines/insert_after for hash-verified edits. " +
+			"The replace variant is exact-only by default because fuzzy fallback is unverified.";
+		return buildEditError(input.absolutePath, "text-not-found", lines.join("\n"), hint, rows.length ? { updatedAnchors: rows } : undefined);
 	}
 	return { content, warnings };
+}
+
+/**
+ * An edit whose result equals the current file is reported as a successful no-op, not an error:
+ * the file already has the requested content, so retrying cannot help. Nothing is written.
+ */
+function buildNoopResult(path: string, message: string, noopEdits: unknown[]) {
+	return {
+		content: [{ type: "text" as const, text: message }],
+		details: {
+			diff: "",
+			patch: "",
+			firstChangedLine: undefined,
+			ptcValue: {
+				tool: "edit",
+				ok: true,
+				noop: true,
+				path,
+				summary: message,
+				diff: "",
+				firstChangedLine: undefined,
+				warnings: [],
+				noopEdits,
+			},
+		} as EditToolDetails & { ptcValue: any },
+	};
 }
 
 function detectNoop(input: {
@@ -522,9 +854,9 @@ function detectNoop(input: {
 	result: string;
 	edits: EditItem[];
 	anchorResult: AnchorEditResult;
-}): EditErrorResult | undefined {
+}): ReturnType<typeof buildNoopResult> | undefined {
 	if (input.originalNormalized !== input.result) return undefined;
-	let diagnostic = `No changes made to ${input.displayPath}. The edits produced identical content.`;
+	let diagnostic = `No changes made to ${input.displayPath}: the file already has this content. Nothing was written.`;
 	if (input.anchorResult.noopEdits?.length) {
 		diagnostic +=
 			"\n" +
@@ -534,7 +866,6 @@ function detectNoop(input: {
 						`Edit ${edit.editIndex}: replacement for ${edit.loc} is identical to current content:\n  ${edit.loc}| ${escapeControlCharsForDisplay(edit.currentContent)}`,
 				)
 				.join("\n");
-		diagnostic += "\nRe-read the file to see the current state.";
 	} else {
 		const lines = input.result.split("\n");
 		const targetLines: string[] = [];
@@ -561,12 +892,84 @@ function detectNoop(input: {
 			diagnostic += `\nThe file currently contains:\n${preview}\nYour edits were normalized back to the original content. Ensure your replacement changes actual code, not just formatting.`;
 		}
 	}
-	return buildEditError(input.absolutePath, "no-op", diagnostic);
+	return buildNoopResult(input.absolutePath, diagnostic, input.anchorResult.noopEdits ?? []);
+}
+
+/**
+ * Anchored and symbol edits need fresh anchors from this session. Text `replace` does not: an
+ * exact, unique match already proves the model knows the current content, and ambiguous or
+ * missing matches are refused before anything is written.
+ */
+function requireReadForAnchors(
+	options: EditToolOptions,
+	absolutePath: string,
+	rawPath: string,
+	usesAnchors: boolean,
+): EditErrorResult | undefined {
+	if (!usesAnchors || !options.wasReadInSession || options.wasReadInSession(absolutePath)) return undefined;
+	const readHint = `Call read(${JSON.stringify(rawPath)}) first, or use grep, ast_search, or write to produce fresh anchors for this file.`;
+	return buildEditError(
+		absolutePath,
+		"file-not-read",
+		[
+			`You must get fresh anchors for ${absolutePath} before editing it.`,
+			readHint,
+			"edit requires fresh LINE:HASH anchors from read, grep, ast_search, or write so the hashes match the current file contents.",
+			"A text replace with an exact, unique old_text does not need a read.",
+		].join(" "),
+		readHint,
+	);
+}
+/** Rows shown in error feedback count as seen: the retry needs no re-read. */
+function recordErrorFeedback<T extends EditErrorResult>(options: EditToolOptions, absolutePath: string, error: T): T {
+	const shown = (error.details.ptcValue as any)?.error?.details?.updatedAnchors as PtcLine[] | undefined;
+	if (shown?.length) {
+		options.served?.record(absolutePath, shown);
+		options.onFileAnchored?.(absolutePath);
+	}
+	return error;
+}
+
+/**
+ * Every line an edit overwrites or removes must still be what the model was shown. Anchors verify
+ * only the lines they name; this also covers range interiors, text replacements, and symbol
+ * bodies. Refuses with the current rows, which then count as shown.
+ */
+function rejectStaleOverwrites(
+	served: ServedLines | undefined,
+	absolutePath: string,
+	originalNormalized: string,
+	result: string,
+): EditErrorResult | undefined {
+	if (!served?.has(absolutePath)) return undefined;
+	const originalLines = originalNormalized.split("\n");
+	const stale = served.findStale(absolutePath, originalLines, overwrittenLines(originalLines, result.split("\n")));
+	if (!stale.length) return undefined;
+	const feedback = formatStaleRows(originalLines, stale);
+	served.record(absolutePath, feedback.rows);
+	const count = stale.length === 1 ? "1 line" : `${stale.length} lines`;
+	return buildEditError(
+		absolutePath,
+		"hash-mismatch",
+		[
+			`Edit rejected — nothing was written. ${count} this edit would overwrite changed on disk since you last saw ${stale.length === 1 ? "it" : "them"} (>>> marks changed lines):`,
+			"",
+			feedback.text,
+			"",
+			"Decide against the current content above and re-issue the edit with these LINE:HASH anchors; no re-read is needed.",
+		].join("\n"),
+		undefined,
+		{ updatedAnchors: feedback.rows },
+	);
 }
 
 export interface EditToolOptions {
 	wasReadInSession?: (absolutePath: string) => boolean;
 	syntaxValidate?: SyntaxValidateOptions["syntaxValidate"];
+	/** What the model was shown of each file; refuses writes over lines that changed since. */
+	served?: ServedLines;
+	/** Called when an edit result shows fresh anchors for a file (refusal feedback). */
+	onFileAnchored?: (absolutePath: string) => void;
 }
 
 async function validateEditSyntax(input: {
@@ -672,6 +1075,8 @@ async function buildEditResult(input: {
 	replaceWarnings: string[];
 	replaceSymbolWarnings: string[];
 	syntaxWarning?: string;
+	/** Notes about lines a cross-file move_lines removed from its source file. */
+	moveNotes?: string[];
 }): Promise<EditSuccessResult> {
 	const diffResult = generateCompactOrFullDiff(input.originalNormalized, input.result);
 	const patch = createPatch(input.displayPath, input.originalNormalized, input.result);
@@ -693,6 +1098,7 @@ async function buildEditResult(input: {
 	if (input.replaceWarnings.length) warnings.push(...input.replaceWarnings);
 	if (input.replaceSymbolWarnings.length) warnings.push(...input.replaceSymbolWarnings);
 	if (input.syntaxWarning) warnings.push(input.syntaxWarning);
+	if (input.moveNotes?.length) warnings.push(...input.moveNotes);
 
 	const internalClassification = classifyEdit(input.originalNormalized, input.result);
 	const difftAvailable = await isDifftAvailable();
@@ -740,14 +1146,6 @@ async function buildEditResult(input: {
 // ─── Registration ───────────────────────────────────────────────────────
 
 export function registerEditTool(pi: ExtensionAPI, options: EditToolOptions = {}) {
-	const ptc = {
-		callable: true,
-		enabled: true,
-		policy: "mutating" as const,
-		readOnly: false,
-		pythonName: "edit",
-		defaultExposure: "not-safe-by-default" as const,
-	};
 	const tool = {
 		name: "edit",
 		label: "Edit",
@@ -755,7 +1153,6 @@ export function registerEditTool(pi: ExtensionAPI, options: EditToolOptions = {}
 		promptSnippet: EDIT_PROMPT_METADATA.promptSnippet,
 		promptGuidelines: EDIT_PROMPT_METADATA.promptGuidelines,
 		parameters: hashlineEditSchema,
-		ptc,
 		renderShell: "default" as const,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const normalized = normalizeToolParameters(hashlineEditSchema, params);
@@ -773,23 +1170,11 @@ export function registerEditTool(pi: ExtensionAPI, options: EditToolOptions = {}
 				const queueKey = await resolveMutationTargetPath(absolutePath);
 				return await withFileMutationQueue(queueKey, async () => {
 					throwIfAborted(signal);
-					if (options.wasReadInSession && !options.wasReadInSession(absolutePath)) {
-						const message = [
-							`You must get fresh anchors for ${absolutePath} before editing it.`,
-							`Call read(${JSON.stringify(rawPath)}) first, or use grep, ast_search, or write to produce fresh anchors for this file.`,
-							"edit requires fresh LINE:HASH anchors from read, grep, ast_search, or write so the hashes match the current file contents.",
-						].join(" ");
-						return buildEditError(
-							absolutePath,
-							"file-not-read",
-							message,
-							`Call read(${JSON.stringify(rawPath)}) first, or use grep, ast_search, or write to produce fresh anchors for this file.`,
-						);
-					}
-
 					const validated = validateEdits({ parsed, rawInput: input, absolutePath, signal });
 					if (isEditErrorResult(validated)) return validated;
 					const { edits, anchorEdits, replaceEdits, replaceSymbolEdits, legacyNormalizationWarning } = validated;
+					const notRead = requireReadForAnchors(options, absolutePath, rawPath, anchorEdits.length + replaceSymbolEdits.length > 0);
+					if (notRead) return notRead;
 
 					const loaded = await loadEditSource({ absolutePath, displayPath: path, signal });
 					if (isEditErrorResult(loaded)) return loaded;
@@ -814,8 +1199,8 @@ export function registerEditTool(pi: ExtensionAPI, options: EditToolOptions = {}
 					const replaceSymbolWarnings = symbolApplication.warnings;
 					let result = symbolApplication.content;
 
-					const anchorResult = applyAnchorEdits({ absolutePath, content: result, anchorEdits, signal });
-					if (isEditErrorResult(anchorResult)) return anchorResult;
+					const anchorResult = await applyAnchorEdits({ absolutePath, content: result, anchorEdits, cwd: ctx.cwd, signal });
+					if (isEditErrorResult(anchorResult)) return recordErrorFeedback(options, absolutePath, anchorResult);
 					result = anchorResult.content;
 
 					const replacementResult = applyReplaceEdits({
@@ -825,7 +1210,7 @@ export function registerEditTool(pi: ExtensionAPI, options: EditToolOptions = {}
 						replaceEdits,
 						signal,
 					});
-					if (isEditErrorResult(replacementResult)) return replacementResult;
+					if (isEditErrorResult(replacementResult)) return recordErrorFeedback(options, absolutePath, replacementResult);
 					result = replacementResult.content;
 					const replaceWarnings = replacementResult.warnings;
 
@@ -838,6 +1223,14 @@ export function registerEditTool(pi: ExtensionAPI, options: EditToolOptions = {}
 						anchorResult,
 					});
 					if (noopError) return noopError;
+
+					const retype = await findCorruptedRetype({ edits: anchorEdits, absolutePath, currentContent: originalNormalized, candidatePaths: options.served?.paths() ?? [], cwd: ctx.cwd });
+					if (retype) return buildEditError(absolutePath, "corrupted-retype", retype.message);
+					const staleError = rejectStaleOverwrites(options.served, absolutePath, originalNormalized, result);
+					if (staleError) options.onFileAnchored?.(absolutePath);
+					if (staleError) return staleError;
+					const sourceRemovals = await planSourceRemovals({ anchorEdits, absolutePath, cwd: ctx.cwd, options, signal });
+					if (isEditErrorResult(sourceRemovals)) return sourceRemovals;
 
 					throwIfAborted(signal);
 
@@ -859,6 +1252,9 @@ export function registerEditTool(pi: ExtensionAPI, options: EditToolOptions = {}
 						postEditVerify: input.postEditVerify === true,
 					});
 					if (isEditErrorResult(writeResult)) return writeResult;
+					options.served?.remapAfterWrite(absolutePath, originalNormalized.split("\n"), result.split("\n"));
+					const moveNotes = await commitSourceRemovals(sourceRemovals, options, path);
+					if (isEditErrorResult(moveNotes)) return moveNotes;
 
 					return await buildEditResult({
 						absolutePath,
@@ -872,6 +1268,7 @@ export function registerEditTool(pi: ExtensionAPI, options: EditToolOptions = {}
 						replaceWarnings,
 						replaceSymbolWarnings,
 						syntaxWarning,
+						moveNotes,
 					});
 				});
 			} catch (err: any) {
@@ -1002,7 +1399,7 @@ export function registerEditTool(pi: ExtensionAPI, options: EditToolOptions = {}
 			}
 			return new Text(clampLinesToWidth(text.split("\n"), width).join("\n"), 0, 0);
 		},
-	} satisfies Parameters<ExtensionAPI["registerTool"]>[0] & { ptc: typeof ptc };
+	} satisfies Parameters<ExtensionAPI["registerTool"]>[0];
 
 	pi.registerTool(tool);
 	return tool;
